@@ -1,0 +1,12 @@
+--- a/vllm/model_executor/layers/quantization/utils/mxfp8_utils.py	2026-09-22 07:15:48.000000000 +0800
++++ b/vllm/model_executor/layers/quantization/utils/mxfp8_utils.py	2026-09-23 00:30:37.982740426 +0800
+@@ -189,6 +189,9 @@
+     is_sf_swizzled_layout: bool = False,
+     alignment: int = 0,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
++    if x.numel() == 0:
++        return mxfp8_e4m3_quantize_fake(x, is_sf_swizzled_layout, alignment)
++
+     from vllm.platforms import current_platform
+     from vllm.utils.flashinfer import has_flashinfer
+ 

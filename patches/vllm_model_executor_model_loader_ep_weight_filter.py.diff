@@ -1,0 +1,28 @@
+--- a/vllm/model_executor/model_loader/ep_weight_filter.py	2026-09-22 07:15:48.000000000 +0800
++++ b/vllm/model_executor/model_loader/ep_weight_filter.py	2026-09-23 00:31:48.899910897 +0800
+@@ -8,8 +8,12 @@
+ ~85-90 % of total weight bytes).
+ """
+ 
++import os
++
+ import regex as re
+ 
++_ENGRAM_DISK = os.environ.get("DSV41_ENGRAM_DISK", "0") == "1"
++
+ # Matches per-expert weight names like ".experts.42.gate_proj.weight".
+ # Does NOT match 3D fused-expert names like ".experts.gate_proj.weight"
+ # (no numeric id) — those are intentionally left unfiltered so the full
+@@ -67,6 +71,12 @@
+ ) -> bool:
+     """Return ``True`` if *weight_name* is an expert weight that does not
+     belong to the local rank and should be skipped during loading."""
++    # DSV41_ENGRAM_DISK=1: Engram tables stay in the checkpoint and are read
++    # row by row at runtime (models/deepseek_v41/nvidia/engram_disk.py).
++    if _ENGRAM_DISK and weight_name.endswith(
++        (".engram.embed.weight", ".engram.embed.scale")
++    ):
++        return True
+     if local_expert_ids is None:
+         return False
+     eid = parse_expert_id(weight_name)

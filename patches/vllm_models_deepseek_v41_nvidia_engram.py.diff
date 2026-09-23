@@ -1,0 +1,119 @@
+--- a/vllm/models/deepseek_v41/nvidia/engram.py	2026-09-22 07:15:49.000000000 +0800
++++ b/vllm/models/deepseek_v41/nvidia/engram.py	2026-09-23 00:31:27.219325617 +0800
+@@ -35,6 +35,11 @@
+ from vllm.models.deepseek_v41.common.engram import (
+     ParallelEngramEmbedding as BaseParallelEngramEmbedding,
+ )
++from vllm.models.deepseek_v41.nvidia.engram_disk import (
++    ENGRAM_DISK,
++    DiskEngramTable,
++    gather_dequant,
++)
+ from vllm.utils.platform_utils import is_uva_available
+ from vllm.utils.torch_utils import get_accelerator_view_from_cpu_tensor
+ 
+@@ -227,7 +232,14 @@
+         block_size: int = 32,
+         cpu_offload: bool = False,
+         dp_shared_memory: bool = False,
++        disk_source: tuple[str, int] | None = None,
+     ) -> None:
++        # (model_dir, layer_id): rows stay in the checkpoint (DSV41_ENGRAM_DISK).
++        self.disk: DiskEngramTable | None = None
++        if disk_source is not None:
++            if dp_shared_memory:
++                raise ValueError("DSV41_ENGRAM_DISK does not support dp_shared_memory")
++            cpu_offload = False
+         self.cpu_offload = cpu_offload
+         self.dp_shared_memory = dp_shared_memory
+         self.dp_size = get_engram_dp_size()
+@@ -246,7 +258,25 @@
+             raise RuntimeError("Engram CPU offload requires UVA support")
+         self._views: tuple[torch.Tensor, torch.Tensor] | None = None
+         self._view_src: tuple[int, int] | None = None
++        self._disk_source = disk_source
+         super().__init__(num_embeddings, dim, head_sizes, block_size)
++        if disk_source is not None:
++            if self.dp_size != 1:
++                raise ValueError("DSV41_ENGRAM_DISK does not support Engram DP")
++            self.disk = DiskEngramTable(
++                disk_source[0],
++                disk_source[1],
++                dim,
++                block_size,
++                row_start=self.vocab_start_idx,
++                num_rows=self.part_num_embeddings,
++            )
++            # The loader skips the checkpoint tables, so keep 1-row buffers
++            # instead of parameters that would fail the loaded-weights check.
++            weight, scales = self.weight.data, self.weight_scale_inv.data
++            del self.weight, self.weight_scale_inv
++            self.register_buffer("weight", weight, persistent=False)
++            self.register_buffer("weight_scale_inv", scales, persistent=False)
+         if cpu_offload:
+             # Constant dummy values avoid randomizing huge CPU lookup tables.
+             set_weight_attrs(self.weight, {"dummy_weight_value": 1.0})
+@@ -267,6 +297,13 @@
+         return self.tp_size * self.dp_size, engram_head_shard_rank()
+ 
+     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
++        if self._disk_source is not None:
++            return (
++                torch.zeros(1, self.dim, dtype=torch.float8_e4m3fn, device="cpu"),
++                torch.zeros(
++                    1, self.dim // self.block_size, dtype=torch.uint8, device="cpu"
++                ),
++            )
+         if self.dp_shared_memory:
+             group = get_engram_dp_group()
+             assert group is not None
+@@ -311,6 +348,34 @@
+         assert self._views is not None
+         return self._views
+ 
++    def lookup(
++        self, indices: torch.Tensor, out: torch.Tensor, background: bool = False
++    ) -> None:
++        if self.disk is None:
++            return super().lookup(indices, out, background)
++        num_tokens = indices.shape[0]
++        if not num_tokens:
++            return
++        if torch.cuda.is_current_stream_capturing():
++            raise RuntimeError(
++                "DSV41_ENGRAM_DISK needs a host round trip; run with --enforce-eager"
++            )
++        local_heads = self.part_n_hash_cols
++        head_end = min(self.head_start + local_heads, self.n_hash_cols)
++        ids = indices[:, self.head_start : head_end].to("cpu", dtype=torch.int64)
++        if ids.shape[1] < local_heads:
++            pad = torch.full(
++                (num_tokens, local_heads - ids.shape[1]), -1, dtype=torch.int64
++            )
++            ids = torch.cat((ids, pad), dim=1)
++        # Same ownership rule as _engram_lookup_kernel: padded heads and ids
++        # outside this rank's buckets produce zero rows.
++        ids = ids.reshape(-1)
++        owned = (ids >= self.vocab_start_idx) & (ids < self.vocab_end_idx)
++        rel = torch.where(owned, ids - self.vocab_start_idx, 0)
++        rows = gather_dequant(self.disk, rel, owned)
++        out[:num_tokens].copy_(rows.view(num_tokens, local_heads, self.dim))
++
+     def forward(self, indices: torch.Tensor) -> torch.Tensor:
+         if self.dp_size == 1:
+             return super().forward(indices)
+@@ -363,6 +428,14 @@
+             tuple(size for order in layout.primes[layer_hash_index] for size in order),
+             cpu_offload=engram_config.cpu_offload,
+             dp_shared_memory=engram_config.dp_shared_memory,
++            disk_source=(
++                (
++                    get_current_vllm_config().model_config.model,
++                    layout.layer_ids[layer_hash_index],
++                )
++                if ENGRAM_DISK
++                else None
++            ),
+         )
+ 
+     def _init_staging(self, max_tokens: int, head_dim: int) -> None:

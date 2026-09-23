@@ -1,0 +1,69 @@
+--- a/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py	2026-09-22 07:15:49.000000000 +0800
++++ b/vllm/models/deepseek_v41/nvidia/flashinfer_sparse.py	2026-09-23 00:29:30.769679379 +0800
+@@ -24,6 +24,7 @@
+     DeepseekV4SparseMLAMetadataBuilder,
+     DeepseekV41SparseSWAMetadataBuilder,
+ )
++from vllm.platforms import current_platform
+ from vllm.platforms.interface import DeviceCapability
+ from vllm.utils.flashinfer import flashinfer_trtllm_batch_decode_sparse_mla_dsv4
+ from vllm.v1.attention.backend import AttentionCGSupport, MultipleOf
+@@ -110,8 +111,22 @@
+ 
+     @staticmethod
+     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
++        # Tech2Wild/Kai 2026-09-10 (SM12x): 64-state compressed pages, so a
++        # ratio-1 kv-source layer needs 64-token pages (128 stays first so the
++        # cache-config default remains 128 for ratio-2 layers).
++        if current_platform.is_cuda() and current_platform.is_device_capability_family(120):
++            return [128, 64]
+         return [128]
+ 
++    @classmethod
++    def get_compressed_block_size(cls, compress_ratio: int) -> int | None:
++        """Tech2Wild/Kai 2026-09-10: tokens per compressed-KV page for a kv-source
++        layer on SM12x (FlashInfer SM120 sparse-MLA prefill/decode kernels are
++        instantiated for 64-state pages); None = use cache_config.block_size."""
++        if compress_ratio > 0 and current_platform.is_cuda() and current_platform.is_device_capability_family(120):
++            return 64 * compress_ratio
++        return None
++
+     @staticmethod
+     def get_name() -> str:
+         return "FLASHINFER_MLA_SPARSE_DSV41"
+@@ -190,6 +205,26 @@
+         return DeepseekSparseSWAFlashInferMetadataBuilder
+ 
+ 
++class DeepseekSparseSWAFlashInferSM120Backend(DeepseekSparseSWAFlashInferBackend):
++    """Tech2Wild/Kai 2026-09-10: SM12x. FlashInfer's SM120 sparse-MLA decode and
++    prefill kernels are instantiated only for 64-token pages
++    (_DECODE_DSV4_PAGE_BLOCK_SIZE = 64); the base backend's "any multiple of 32"
++    made vLLM build the SWA cache at 32-token pages, which the SM120 path rejects
++    ("no decode kernel for this shape ... page_block_size=32")."""
++
++    @staticmethod
++    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
++        return [64]
++
++    @classmethod
++    def get_preferred_block_size(cls, default_block_size: int) -> int:
++        return 64
++
++    @classmethod
++    def get_swa_block_size(cls) -> int:
++        return 64
++
++
+ class DeepseekV4FlashInferMLAAttention(DeepseekV4Attention):
+     """FlashInfer TRTLLM-gen sparse MLA attention layer for SM100 DeepSeek V4."""
+ 
+@@ -543,7 +578,7 @@
+     """DeepSeek V4 sparse MLA attention through FlashInfer's SM120 kernels."""
+ 
+     backend_cls = DeepseekV4FlashInferMLASparseBackend
+-    swa_backend_cls = DeepseekSparseSWAFlashInferBackend
++    swa_backend_cls = DeepseekSparseSWAFlashInferSM120Backend
+     use_fp8_ds_mla_layout: ClassVar[bool] = True
+ 
+     @staticmethod
