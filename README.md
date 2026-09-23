@@ -28,11 +28,12 @@ files/      the nine files mounted over the image at run time: eight modified
 patches/    the eight modified files as unified diffs against stock 0.30.0
 scripts/    serve.sh, the two-node launcher
 tests/      bit-exact equivalence test for the disk-backed Engram path
-docs/       porting notes, written up in Traditional Chinese
+docs/       the write-up of this port, in Traditional Chinese
 ```
 
-The long-form write-up of how this port was done, and why each piece was kept,
-rewritten or dropped, is in [docs/porting-notes-zh-TW.md](docs/porting-notes-zh-TW.md).
+How this port was done, and why each piece was kept, rewritten or dropped, is
+written up in [docs/porting-notes-zh-TW.md](docs/porting-notes-zh-TW.md)
+(Traditional Chinese), including the measurement method and its limits.
 
 ## The five things that had to change
 
